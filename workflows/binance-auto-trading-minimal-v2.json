@@ -1,0 +1,318 @@
+{
+	"name": "Binance Auto Trading (Minimal Flow)",
+	"nodes": [
+		{
+			"parameters": {
+				"rule": {
+					"interval": [
+						{
+							"field": "minutes",
+							"minutesInterval": 5
+						}
+					]
+				}
+			},
+			"id": "schedule-1",
+			"name": "Schedule Trigger",
+			"type": "n8n-nodes-base.scheduleTrigger",
+			"typeVersion": 1.2,
+			"position": [240, 260]
+		},
+		{
+			"parameters": {
+				"url": "={{ $env.BINANCE_API_BASE ?? 'https://api.binance.com' }}/api/v3/klines",
+				"sendQuery": true,
+				"queryParameters": {
+					"parameters": [
+						{
+							"name": "symbol",
+							"value": "={{ $env.BINANCE_SYMBOL ?? 'BTCUSDT' }}"
+						},
+						{
+							"name": "interval",
+							"value": "={{ $env.BINANCE_INTERVAL ?? '5m' }}"
+						},
+						{
+							"name": "limit",
+							"value": "={{ $env.BINANCE_CANDLE_LIMIT ?? 200 }}"
+						}
+					]
+				},
+				"options": {}
+			},
+			"id": "http-1",
+			"name": "Fetch Binance Candles",
+			"type": "n8n-nodes-base.httpRequest",
+			"typeVersion": 4.2,
+			"position": [470, 260]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 计算 SMA 信号并决定是否下单（强制选择 BUY 或 SELL）\n// HTTP Request 节点将数组拆分为多个输出项，需要收集所有项\nconst allItems = $input.all();\nif (!allItems || allItems.length === 0) {\n  throw new Error('Binance kline response is empty.');\n}\n// 每个输入项的 json 属性是一个单独的蜡烛数据（数组）\n// 收集所有蜡烛数据\nconst candles = allItems.map(item => item.json);\nif (!Array.isArray(candles) || candles.length === 0) {\n  throw new Error('Binance kline response is empty.');\n}\n// 每个蜡烛数据是一个数组，第5个元素（索引4）是收盘价\nconst closes = candles.map((row) => {\n  // 如果 row 本身是数组，取索引4；如果 row 是对象，可能需要其他方式\n  if (Array.isArray(row)) {\n    return Number(row[4]);\n  }\n  // 如果 HTTP Request 返回的是对象格式，尝试从对象中提取\n  // 这种情况不应该发生，但为了健壮性添加\n  throw new Error('Unexpected candle data format.');\n}).filter(price => Number.isFinite(price));\nif (closes.length === 0) {\n  throw new Error('No valid close prices found in candles.');\n}\nconst shortPeriod = Number($env.BINANCE_SHORT_SMA ?? 9);\nconst longPeriod = Number($env.BINANCE_LONG_SMA ?? 26);\nconst threshold = Number($env.BINANCE_SIGNAL_THRESHOLD ?? 0.001);\nif (!Number.isFinite(shortPeriod) || shortPeriod <= 0) {\n  throw new Error('BINANCE_SHORT_SMA must be a positive integer.');\n}\nif (!Number.isFinite(longPeriod) || longPeriod <= 0) {\n  throw new Error('BINANCE_LONG_SMA must be a positive integer.');\n}\nconst required = Math.max(shortPeriod, longPeriod);\nconst quoteOrderQty = Number($env.BINANCE_QUOTE_ORDER_QTY ?? 50);\nconst symbol = String($env.BINANCE_SYMBOL ?? 'BTCUSDT').toUpperCase();\nconst latestClose = closes.length > 0 ? closes[closes.length - 1] : 0;\nconst sma = (values, period) => {\n  if (period <= 0 || values.length === 0) {\n    return null;\n  }\n  const slice = values.slice(-period);\n  return slice.reduce((sum, value) => sum + value, 0) / period;\n};\nconst clampPeriod = (period) => Math.min(period, closes.length);\nconst shortSmaRaw = sma(closes, clampPeriod(shortPeriod));\nconst longSmaRaw = sma(closes, clampPeriod(longPeriod));\nconst formatOrNull = (value, digits = 2) => (value === null ? null : Number(value.toFixed(digits)));\n// 计算 smaDelta\nlet smaDelta = 0;\nif (longSmaRaw !== null && longSmaRaw !== 0) {\n  smaDelta = (shortSmaRaw !== null ? shortSmaRaw - longSmaRaw : 0) / longSmaRaw;\n} else if (shortSmaRaw !== null && closes.length >= 2) {\n  // 如果长期 SMA 不可用，使用价格趋势判断\n  const recentTrend = closes[closes.length - 1] - closes[closes.length - 2];\n  smaDelta = recentTrend > 0 ? threshold : -threshold;\n}\n// 强制选择：如果 smaDelta > 0 则 BUY，否则 SELL（不再有 HOLD）\n// 即使数据不足或 smaDelta 接近 0，也强制选择一个方向\nlet signal = smaDelta > 0 ? 'BUY' : 'SELL';\n// 如果数据不足，基于最近价格趋势强制选择\nif (closes.length < required) {\n  if (closes.length >= 2) {\n    const recentTrend = closes[closes.length - 1] - closes[closes.length - 2];\n    signal = recentTrend >= 0 ? 'BUY' : 'SELL';\n  } else {\n    // 如果数据极少，默认 BUY（可以根据需要调整）\n    signal = 'BUY';\n  }\n}\nreturn [\n  {\n    json: {\n      symbol,\n      price: Number(latestClose.toFixed(2)),\n      shortSma: formatOrNull(shortSmaRaw),\n      longSma: formatOrNull(longSmaRaw),\n      smaDelta: Number(smaDelta.toFixed(4)),\n      threshold,\n      signal,\n      shouldTrade: true,\n      quoteOrderQty,\n      reason: closes.length < required ? `Insufficient candles: need ${required}, got ${closes.length}, forced ${signal}` : null,\n      generatedAt: new Date().toISOString()\n    }\n  }\n];"
+			},
+			"id": "code-1",
+			"name": "Calculate Signal & Decide",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [690, 260]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 构建 Binance 市价单载荷\nconst [{ json: indicator }] = $input.all();\nconst recvWindow = Number($env.BINANCE_RECV_WINDOW ?? 5000);\nreturn [\n  {\n    json: {\n      symbol: indicator.symbol,\n      side: indicator.signal,\n      type: 'MARKET',\n      quoteOrderQty: indicator.quoteOrderQty,\n      recvWindow,\n      timestamp: Date.now(),\n      indicator\n    }\n  }\n];"
+			},
+			"id": "code-2",
+			"name": "Build Market Order",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [910, 260]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 构建查询字符串用于签名\nconst [{ json: payload }] = $input.all();\nconst ordered = {\n  symbol: payload.symbol,\n  side: payload.side,\n  type: payload.type,\n  quoteOrderQty: payload.quoteOrderQty,\n  recvWindow: payload.recvWindow,\n  timestamp: payload.timestamp\n};\nconst query = Object.entries(ordered)\n  .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)\n  .join('&');\nreturn [\n  {\n    json: {\n      ...payload,\n      queryString: query\n    }\n  }\n];"
+			},
+			"id": "code-3",
+			"name": "Build Query String",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [1130, 260]
+		},
+		{
+			"parameters": {
+				"action": "hmac",
+				"type": "SHA256",
+				"value": "={{ $json.queryString }}",
+				"secret": "={{ $env.BINANCE_API_SECRET }}",
+				"encoding": "hex",
+				"options": {}
+			},
+			"id": "crypto-1",
+			"name": "Sign with HMAC-SHA256",
+			"type": "n8n-nodes-base.crypto",
+			"typeVersion": 1,
+			"position": [1350, 260]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 合并签名到 payload\n// Crypto 节点会将 HMAC 结果存储在 'data' 字段中，并保留所有原始字段\nconst [{ json: cryptoOutput }] = $input.all();\nconst signature = cryptoOutput.data || '';\nreturn [\n  {\n    json: {\n      symbol: cryptoOutput.symbol,\n      side: cryptoOutput.side,\n      type: cryptoOutput.type,\n      quoteOrderQty: cryptoOutput.quoteOrderQty,\n      recvWindow: cryptoOutput.recvWindow,\n      timestamp: cryptoOutput.timestamp,\n      signature: signature\n    }\n  }\n];"
+			},
+			"id": "code-5",
+			"name": "Merge Signature",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [1570, 260]
+		},
+		{
+			"parameters": {
+				"url": "={{ $env.BINANCE_API_BASE ?? 'https://api.binance.com' }}/api/v3/order",
+				"method": "POST",
+				"sendQuery": true,
+				"queryParameters": {
+					"parameters": [
+						{ "name": "symbol", "value": "={{ $json.symbol }}" },
+						{ "name": "side", "value": "={{ $json.side }}" },
+						{ "name": "type", "value": "={{ $json.type }}" },
+						{ "name": "quoteOrderQty", "value": "={{ $json.quoteOrderQty }}" },
+						{ "name": "recvWindow", "value": "={{ $json.recvWindow }}" },
+						{ "name": "timestamp", "value": "={{ $json.timestamp }}" },
+						{ "name": "signature", "value": "={{ $json.signature }}" }
+					]
+				},
+				"sendHeaders": true,
+				"headerParameters": {
+					"parameters": [
+						{ "name": "X-MBX-APIKEY", "value": "={{ $env.BINANCE_API_KEY }}" },
+						{ "name": "Content-Type", "value": "application/x-www-form-urlencoded" }
+					]
+				},
+				"options": {}
+			},
+			"id": "http-2",
+			"name": "Submit Binance Order",
+			"type": "n8n-nodes-base.httpRequest",
+			"typeVersion": 4.2,
+			"position": [1790, 260]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 输出执行摘要\nconst signal = $node['Calculate Signal & Decide'].json;\nlet order = null;\ntry {\n  order = $node['Submit Binance Order'].json;\n} catch (error) {\n  order = null;\n}\nif (order) {\n  return [\n    {\n      json: {\n        event: 'TRADE_EXECUTED',\n        status: order.status ?? 'UNKNOWN',\n        symbol: order.symbol ?? signal.symbol,\n        side: order.side ?? signal.signal,\n        executedQty: Number(order.executedQty ?? 0),\n        cummulativeQuoteQty: Number(order.cummulativeQuoteQty ?? 0),\n        binanceOrderId: order.orderId ?? null,\n        price: signal.price,\n        shortSma: signal.shortSma,\n        longSma: signal.longSma,\n        smaDelta: signal.smaDelta,\n        timestamp: new Date().toISOString()\n      }\n    }\n  ];\n}\nreturn [\n  {\n    json: {\n      event: 'SIGNAL_ONLY',\n      status: 'NO_TRADE',\n      symbol: signal.symbol,\n      signal: signal.signal,\n      price: signal.price,\n      shortSma: signal.shortSma,\n      longSma: signal.longSma,\n      smaDelta: signal.smaDelta,\n      reason: 'Signal below threshold',\n      timestamp: new Date().toISOString()\n    }\n  }\n];"
+			},
+			"id": "code-4",
+			"name": "Execution Summary",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [2010, 260]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 构建查询订单历史的查询字符串\nconst symbol = $env.BINANCE_SYMBOL ?? 'BTCUSDT';\nconst limit = 10; // 查询最近10条订单\nconst timestamp = Date.now();\nconst query = `symbol=${encodeURIComponent(symbol)}&limit=${limit}&timestamp=${timestamp}`;\nreturn [\n  {\n    json: {\n      queryString: query,\n      symbol,\n      limit,\n      timestamp\n    }\n  }\n];"
+			},
+			"id": "code-6",
+			"name": "Build Order History Query",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [240, 400]
+		},
+		{
+			"parameters": {
+				"action": "hmac",
+				"type": "SHA256",
+				"value": "={{ $json.queryString }}",
+				"secret": "={{ $env.BINANCE_API_SECRET }}",
+				"encoding": "hex",
+				"options": {}
+			},
+			"id": "crypto-2",
+			"name": "Sign Order History Query",
+			"type": "n8n-nodes-base.crypto",
+			"typeVersion": 1,
+			"position": [470, 400]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 合并签名到查询参数\nconst [{ json: cryptoOutput }] = $input.all();\nconst signature = cryptoOutput.data || '';\nreturn [\n  {\n    json: {\n      symbol: cryptoOutput.symbol,\n      limit: cryptoOutput.limit,\n      timestamp: cryptoOutput.timestamp,\n      signature: signature\n    }\n  }\n];"
+			},
+			"id": "code-7",
+			"name": "Merge History Signature",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [690, 400]
+		},
+		{
+			"parameters": {
+				"url": "={{ $env.BINANCE_API_BASE ?? 'https://api.binance.com' }}/api/v3/allOrders",
+				"method": "GET",
+				"sendQuery": true,
+				"queryParameters": {
+					"parameters": [
+						{ "name": "symbol", "value": "={{ $json.symbol }}" },
+						{ "name": "limit", "value": "={{ $json.limit }}" },
+						{ "name": "timestamp", "value": "={{ $json.timestamp }}" },
+						{ "name": "signature", "value": "={{ $json.signature }}" }
+					]
+				},
+				"sendHeaders": true,
+				"headerParameters": {
+					"parameters": [
+						{ "name": "X-MBX-APIKEY", "value": "={{ $env.BINANCE_API_KEY }}" }
+					]
+				},
+				"options": {}
+			},
+			"id": "http-3",
+			"name": "Query Order History",
+			"type": "n8n-nodes-base.httpRequest",
+			"typeVersion": 4.2,
+			"position": [910, 400]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 格式化订单历史输出\n// 币安 API 返回的是一个订单数组\nconst [{ json: response }] = $input.all();\nlet orders = [];\n// 检查响应格式：可能是数组，也可能是对象包含数组\nif (Array.isArray(response)) {\n  orders = response;\n} else if (response && Array.isArray(response.data)) {\n  orders = response.data;\n} else if (response && response.orderId) {\n  // 单个订单对象\n  orders = [response];\n} else {\n  orders = [];\n}\n// 过滤有效订单并按时间倒序排列（最新的在前）\norders = orders.filter(order => order && order.orderId);\norders.sort((a, b) => (b.time || 0) - (a.time || 0));\n// 格式化订单数据\nconst formattedOrders = orders.map(order => ({\n  orderId: order.orderId,\n  symbol: order.symbol,\n  side: order.side,\n  type: order.type,\n  status: order.status,\n  price: order.price ? Number(order.price) : null,\n  executedQty: Number(order.executedQty || 0),\n  cummulativeQuoteQty: Number(order.cummulativeQuoteQty || 0),\n  time: order.time ? new Date(order.time).toISOString() : null,\n  updateTime: order.updateTime ? new Date(order.updateTime).toISOString() : null,\n  clientOrderId: order.clientOrderId || null\n}));\nreturn [\n  {\n    json: {\n      totalOrders: formattedOrders.length,\n      message: formattedOrders.length > 0 ? 'Orders retrieved successfully' : 'No orders found',\n      orders: formattedOrders,\n      queryTime: new Date().toISOString()\n    }\n  }\n];"
+			},
+			"id": "code-8",
+			"name": "Format Order History",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [1130, 400]
+		}
+	],
+	"connections": {
+		"Schedule Trigger": {
+			"main": [
+				[
+					{ "node": "Fetch Binance Candles", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Fetch Binance Candles": {
+			"main": [
+				[
+					{ "node": "Calculate Signal & Decide", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Calculate Signal & Decide": {
+			"main": [
+				[
+					{ "node": "Build Market Order", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Build Market Order": {
+			"main": [
+				[
+					{ "node": "Build Query String", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Build Query String": {
+			"main": [
+				[
+					{ "node": "Sign with HMAC-SHA256", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Sign with HMAC-SHA256": {
+			"main": [
+				[
+					{ "node": "Merge Signature", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Merge Signature": {
+			"main": [
+				[
+					{ "node": "Submit Binance Order", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Submit Binance Order": {
+			"main": [
+				[
+					{ "node": "Execution Summary", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Execution Summary": {
+			"main": [
+				[
+					{ "node": "Build Order History Query", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Build Order History Query": {
+			"main": [
+				[
+					{ "node": "Sign Order History Query", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Sign Order History Query": {
+			"main": [
+				[
+					{ "node": "Merge History Signature", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Merge History Signature": {
+			"main": [
+				[
+					{ "node": "Query Order History", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Query Order History": {
+			"main": [
+				[
+					{ "node": "Format Order History", "type": "main", "index": 0 }
+				]
+			]
+		}
+	},
+	"active": false,
+	"settings": {
+		"executionOrder": "v1"
+	},
+	"meta": {
+		"templateCredsSetupCompleted": false
+	}
+}

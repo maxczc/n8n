@@ -1,0 +1,255 @@
+{
+	"name": "Binance Auto Trading (Minimal)",
+	"nodes": [
+		{
+			"parameters": {
+				"rule": {
+					"interval": [
+						{
+							"field": "minutes",
+							"minutesInterval": 5
+						}
+					]
+				}
+			},
+			"id": "trigger-1",
+			"name": "Schedule Trigger",
+			"type": "n8n-nodes-base.scheduleTrigger",
+			"typeVersion": 1.2,
+			"position": [240, 300]
+		},
+		{
+			"parameters": {
+				"url": "={{ $env.BINANCE_API_BASE ?? 'https://api.binance.com' }}/api/v3/klines",
+				"sendQuery": true,
+				"queryParameters": {
+					"parameters": [
+						{
+							"name": "symbol",
+							"value": "={{ $env.BINANCE_SYMBOL ?? 'BTCUSDT' }}"
+						},
+						{
+							"name": "interval",
+							"value": "={{ $env.BINANCE_INTERVAL ?? '5m' }}"
+						},
+						{
+							"name": "limit",
+							"value": "={{ $env.BINANCE_CANDLE_LIMIT ?? 30 }}"
+						}
+					]
+				},
+				"options": {}
+			},
+			"id": "http-1",
+			"name": "Fetch Binance Candles",
+			"type": "n8n-nodes-base.httpRequest",
+			"typeVersion": 4.2,
+			"position": [460, 300]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 简化的信号计算：基于简单移动平均线 (SMA)\nconst [{ json: candles }] = $input.all();\n\nif (!Array.isArray(candles) || candles.length === 0) {\n  throw new Error('Binance kline response is empty.');\n}\n\n// 提取收盘价\nconst closes = candles.map((row) => Number(row[4]));\n\n// 配置参数（可通过环境变量覆盖）\nconst shortPeriod = Number($env.BINANCE_SHORT_SMA ?? 7);\nconst longPeriod = Number($env.BINANCE_LONG_SMA ?? 25);\nconst threshold = Number($env.BINANCE_SIGNAL_THRESHOLD ?? 0.001);\n\nif (closes.length < longPeriod) {\n  throw new Error(`Not enough candles. Need at least ${longPeriod}, got ${closes.length}`);\n}\n\n// 计算简单移动平均线\nconst sma = (values, period) => {\n  const slice = values.slice(-period);\n  return slice.reduce((sum, value) => sum + value, 0) / period;\n};\n\nconst shortSma = sma(closes, shortPeriod);\nconst longSma = sma(closes, longPeriod);\nconst latestClose = closes[closes.length - 1];\n\n// 计算信号：短均线相对长均线的偏差\nconst smaDelta = longSma !== 0 ? (shortSma - longSma) / longSma : 0;\n\n// 生成交易信号\nlet signal = 'HOLD';\nif (smaDelta > threshold) {\n  signal = 'BUY';\n} else if (smaDelta < -threshold) {\n  signal = 'SELL';\n}\n\nreturn [\n  {\n    json: {\n      symbol: $env.BINANCE_SYMBOL ?? 'BTCUSDT',\n      price: Number(latestClose.toFixed(2)),\n      shortSma: Number(shortSma.toFixed(2)),\n      longSma: Number(longSma.toFixed(2)),\n      smaDelta: Number(smaDelta.toFixed(4)),\n      threshold,\n      signal,\n      generatedAt: new Date().toISOString()\n    }\n  }\n];"
+			},
+			"id": "code-1",
+			"name": "Calculate Signal",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [680, 300]
+		},
+		{
+			"parameters": {
+				"conditions": {
+					"options": {
+						"caseSensitive": false,
+						"leftValue": "",
+						"typeValidation": "strict"
+					},
+					"conditions": [
+						{
+							"id": "condition-1",
+							"leftValue": "={{ $json.signal }}",
+							"rightValue": "BUY",
+							"operator": {
+								"type": "string",
+								"operation": "equals"
+							}
+						}
+					],
+					"combinator": "and"
+				},
+				"options": {}
+			},
+			"id": "if-1",
+			"name": "Should Buy?",
+			"type": "n8n-nodes-base.if",
+			"typeVersion": 2.2,
+			"position": [900, 300]
+		},
+		{
+			"parameters": {
+				"conditions": {
+					"options": {
+						"caseSensitive": false,
+						"leftValue": "",
+						"typeValidation": "strict"
+					},
+					"conditions": [
+						{
+							"id": "condition-2",
+							"leftValue": "={{ $json.signal }}",
+							"rightValue": "SELL",
+							"operator": {
+								"type": "string",
+								"operation": "equals"
+							}
+						}
+					],
+					"combinator": "and"
+				},
+				"options": {}
+			},
+			"id": "if-2",
+			"name": "Should Sell?",
+			"type": "n8n-nodes-base.if",
+			"typeVersion": 2.2,
+			"position": [900, 420]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 构建订单载荷\nconst [{ json: input }] = $input.all();\n\nconst quoteOrderQty = Number($env.BINANCE_QUOTE_ORDER_QTY ?? 50);\nconst recvWindow = Number($env.BINANCE_RECV_WINDOW ?? 5000);\n\nreturn [\n  {\n    json: {\n      symbol: input.symbol,\n      side: input.signal,\n      type: 'MARKET',\n      quoteOrderQty,\n      recvWindow,\n      timestamp: Date.now(),\n      price: input.price,\n      shortSma: input.shortSma,\n      longSma: input.longSma,\n      smaDelta: input.smaDelta\n    }\n  }\n];"
+			},
+			"id": "code-2",
+			"name": "Build Order Payload",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [1120, 300]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 为 Binance 订单生成 HMAC-SHA256 签名\nconst crypto = require('crypto');\nconst [{ json: payload }] = $input.all();\n\nconst apiSecret = $env.BINANCE_API_SECRET;\nif (!apiSecret) {\n  throw new Error('BINANCE_API_SECRET is not defined.');\n}\n\n// 按字母顺序排列参数（Binance 要求）\nconst orderedPayload = {\n  symbol: payload.symbol,\n  side: payload.side,\n  type: payload.type,\n  quoteOrderQty: payload.quoteOrderQty,\n  recvWindow: payload.recvWindow,\n  timestamp: payload.timestamp\n};\n\n// 构建查询字符串\nconst query = Object.entries(orderedPayload)\n  .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)\n  .join('&');\n\n// 生成签名\nconst signature = crypto\n  .createHmac('sha256', apiSecret)\n  .update(query)\n  .digest('hex');\n\nreturn [\n  {\n    json: {\n      ...payload,\n      signature\n    }\n  }\n];"
+			},
+			"id": "code-3",
+			"name": "Sign Binance Order",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [1340, 300]
+		},
+		{
+			"parameters": {
+				"url": "={{ $env.BINANCE_API_BASE ?? 'https://api.binance.com' }}/api/v3/order",
+				"method": "POST",
+				"sendQuery": true,
+				"queryParameters": {
+					"parameters": [
+						{ "name": "symbol", "value": "={{ $json.symbol }}" },
+						{ "name": "side", "value": "={{ $json.side }}" },
+						{ "name": "type", "value": "={{ $json.type }}" },
+						{ "name": "quoteOrderQty", "value": "={{ $json.quoteOrderQty }}" },
+						{ "name": "recvWindow", "value": "={{ $json.recvWindow }}" },
+						{ "name": "timestamp", "value": "={{ $json.timestamp }}" },
+						{ "name": "signature", "value": "={{ $json.signature }}" }
+					]
+				},
+				"sendHeaders": true,
+				"headerParameters": {
+					"parameters": [
+						{ "name": "X-MBX-APIKEY", "value": "={{ $env.BINANCE_API_KEY }}" },
+						{ "name": "Content-Type", "value": "application/x-www-form-urlencoded" }
+					]
+				},
+				"options": {}
+			},
+			"id": "http-2",
+			"name": "Submit Binance Order",
+			"type": "n8n-nodes-base.httpRequest",
+			"typeVersion": 4.2,
+			"position": [1560, 300]
+		},
+		{
+			"parameters": {
+				"jsCode": "// 输出执行摘要\nconst signal = $node['Calculate Signal'].json;\nlet order = null;\n\ntry {\n  order = $node['Submit Binance Order'].json;\n} catch (error) {\n  // 如果没有订单（信号为 HOLD），则返回信号信息\n}\n\nif (order) {\n  return [\n    {\n      json: {\n        event: 'TRADE_EXECUTED',\n        status: order.status ?? 'UNKNOWN',\n        symbol: order.symbol ?? signal.symbol,\n        side: order.side ?? signal.signal,\n        executedQty: Number(order.executedQty ?? 0),\n        cummulativeQuoteQty: Number(order.cummulativeQuoteQty ?? 0),\n        binanceOrderId: order.orderId ?? null,\n        price: signal.price,\n        shortSma: signal.shortSma,\n        longSma: signal.longSma,\n        smaDelta: signal.smaDelta,\n        timestamp: new Date().toISOString()\n      }\n    }\n  ];\n}\n\n// 如果没有执行订单，返回信号信息\nreturn [\n  {\n    json: {\n      event: 'SIGNAL_GENERATED',\n      status: 'NO_TRADE',\n      symbol: signal.symbol,\n      signal: signal.signal,\n      price: signal.price,\n      shortSma: signal.shortSma,\n      longSma: signal.longSma,\n      smaDelta: signal.smaDelta,\n      reason: signal.signal === 'HOLD' ? 'Signal below threshold' : 'Unknown',\n      timestamp: new Date().toISOString()\n    }\n  }\n];"
+			},
+			"id": "code-4",
+			"name": "Execution Summary",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [1780, 300]
+		}
+	],
+	"connections": {
+		"Schedule Trigger": {
+			"main": [
+				[
+					{ "node": "Fetch Binance Candles", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Fetch Binance Candles": {
+			"main": [
+				[
+					{ "node": "Calculate Signal", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Calculate Signal": {
+			"main": [
+				[
+					{ "node": "Should Buy?", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Should Buy?": {
+			"main": [
+				[
+					{ "node": "Build Order Payload", "type": "main", "index": 0 }
+				],
+				[
+					{ "node": "Should Sell?", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Should Sell?": {
+			"main": [
+				[
+					{ "node": "Build Order Payload", "type": "main", "index": 0 }
+				],
+				[
+					{ "node": "Execution Summary", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Build Order Payload": {
+			"main": [
+				[
+					{ "node": "Sign Binance Order", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Sign Binance Order": {
+			"main": [
+				[
+					{ "node": "Submit Binance Order", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Submit Binance Order": {
+			"main": [
+				[
+					{ "node": "Execution Summary", "type": "main", "index": 0 }
+				]
+			]
+		}
+	},
+	"active": false,
+	"settings": {
+		"executionOrder": "v1"
+	},
+	"meta": {
+		"templateCredsSetupCompleted": false
+	}
+}
+
+
+
+
+

@@ -215,6 +215,14 @@ export default mergeConfig(
 			esbuildOptions: {
 				target,
 			},
+			// Exclude dependencies that are incompatible with Vite's dependency optimizer
+			// or cause issues with pre-bundling
+			exclude: [
+				// WASM-based packages that don't work well with dependency optimization
+				'@sqlite.org/sqlite-wasm',
+				'web-tree-sitter',
+				'curlconverter',
+			],
 		},
 		worker: {
 			format: 'es',

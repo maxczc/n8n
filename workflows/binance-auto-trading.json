@@ -1,0 +1,322 @@
+{
+	"name": "Binance Auto Trading",
+	"nodes": [
+		{
+			"parameters": {
+				"rule": {
+					"interval": [{}]
+				}
+			},
+			"id": "e079b8c1-729d-4200-b8c9-cbc482692b9b",
+			"name": "Schedule Trigger",
+			"type": "n8n-nodes-base.scheduleTrigger",
+			"typeVersion": 1.2,
+			"position": [-820, 0]
+		},
+		{
+			"parameters": {
+				"url": "={{ $env.BINANCE_API_BASE ?? 'https://api.binance.com' }}/api/v3/klines",
+				"sendQuery": true,
+				"queryParameters": {
+					"parameters": [
+						{
+							"name": "symbol",
+							"value": "={{ $env.BINANCE_SYMBOL ?? 'BTCUSDT' }}"
+						},
+						{
+							"name": "interval",
+							"value": "={{ $env.BINANCE_INTERVAL ?? '1m' }}"
+						},
+						{
+							"name": "limit",
+							"value": "={{ $env.BINANCE_CANDLE_LIMIT ?? 1000 }}"
+						},
+						{
+							"name": "startTime",
+							"value": "={{ $env.BINANCE_START_TIME ? parseInt($env.BINANCE_START_TIME) : undefined }}"
+						},
+						{
+							"name": "endTime",
+							"value": "={{ $env.BINANCE_END_TIME ? parseInt($env.BINANCE_END_TIME) : undefined }}"
+						}
+					]
+				},
+				"options": {}
+			},
+			"id": "53e4f236-1a55-4b43-8cc8-53232cea807c",
+			"name": "Fetch Binance Candles",
+			"type": "n8n-nodes-base.httpRequest",
+			"typeVersion": 4.2,
+			"position": [-600, 0]
+		},
+		{
+		"parameters": {
+			"jsCode": "const [{ json: candles }] = $input.all();\nif (!Array.isArray(candles) || candles.length === 0) {\n  throw new Error('Binance kline response is empty.');\n}\nconst closes = candles.map((row) => Number(row[4]));\nconst shortPeriod = Number($env.BINANCE_SHORT_EMA ?? $env.BINANCE_SHORT_SMA ?? 5);\nconst longPeriod = Number($env.BINANCE_LONG_EMA ?? $env.BINANCE_LONG_SMA ?? 15);\nconst threshold = Number($env.BINANCE_EMA_THRESHOLD ?? $env.BINANCE_SIGNAL_THRESHOLD ?? 0.001);\nif (!Number.isFinite(shortPeriod) || shortPeriod <= 0) {\n  throw new Error('BINANCE_SHORT_EMA must be a positive integer.');\n}\nif (!Number.isFinite(longPeriod) || longPeriod <= 0) {\n  throw new Error('BINANCE_LONG_EMA must be a positive integer.');\n}\nconst maxPeriod = Math.max(shortPeriod, longPeriod);\nconst symbol = $env.BINANCE_SYMBOL ?? 'BTCUSDT';\nconst interval = $env.BINANCE_INTERVAL ?? '1m';\nconst requestedLimit = Number($env.BINANCE_CANDLE_LIMIT ?? 100);\nconst latestClose = closes.length > 0 ? closes[closes.length - 1] : 0;\nif (maxPeriod > closes.length) {\n  return [\n    {\n      json: {\n        symbol,\n        price: Number(latestClose.toFixed(2)),\n        shortSma: null,\n        longSma: null,\n        shortEma: null,\n        longEma: null,\n        emaDelta: 0,\n        emaThreshold: threshold,\n        signalSource: 'EMA',\n        signal: 'HOLD',\n        reason: `Insufficient candles: received ${closes.length}, need at least ${maxPeriod} for EMA calculation (short=${shortPeriod}, long=${longPeriod})`,\n        diagnostics: {\n          issue: 'INSUFFICIENT_CANDLES',\n          received: closes.length,\n          required: maxPeriod,\n          shortPeriod,\n          longPeriod,\n          symbol,\n          interval,\n          requestedLimit,\n          suggestion: `Increase BINANCE_CANDLE_LIMIT to at least ${maxPeriod + 100}, or use a longer interval (e.g., 15m, 1h) if ${interval} has limited history`\n        },\n        generatedAt: new Date().toISOString()\n      }\n    }\n  ];\n}\nconst sma = (values, period) => {\n  const slice = values.slice(-period);\n  const total = slice.reduce((sum, value) => sum + value, 0);\n  return total / period;\n};\nconst ema = (values, period) => {\n  if (values.length < period) {\n    return null;\n  }\n  const multiplier = 2 / (period + 1);\n  let emaPrev = values.slice(0, period).reduce((sum, value) => sum + value, 0) / period;\n  for (let i = period; i < values.length; i += 1) {\n    emaPrev = (values[i] - emaPrev) * multiplier + emaPrev;\n  }\n  return emaPrev;\n};\nconst shortSma = sma(closes, shortPeriod);\nconst longSma = sma(closes, longPeriod);\nconst shortEma = ema(closes, shortPeriod);\nconst longEma = ema(closes, longPeriod);\nif (shortEma === null || longEma === null) {\n  return [\n    {\n      json: {\n        symbol,\n        price: Number(latestClose.toFixed(2)),\n        shortSma: Number(shortSma.toFixed(2)),\n        longSma: Number(longSma.toFixed(2)),\n        shortEma: null,\n        longEma: null,\n        emaDelta: 0,\n        emaThreshold: threshold,\n        signalSource: 'EMA',\n        signal: 'HOLD',\n        reason: `Insufficient candles to compute EMAs: received ${closes.length}, shortEma=${shortEma === null ? 'null' : 'ok'}, longEma=${longEma === null ? 'null' : 'ok'} (short=${shortPeriod}, long=${longPeriod})`,\n        diagnostics: {\n          issue: 'INSUFFICIENT_CANDLES',\n          received: closes.length,\n          required: maxPeriod,\n          shortPeriod,\n          longPeriod,\n          symbol,\n          interval,\n          requestedLimit,\n          suggestion: `Increase BINANCE_CANDLE_LIMIT to at least ${maxPeriod + 100}, or use a longer interval (e.g., 15m, 1h) if ${interval} has limited history`\n        },\n        generatedAt: new Date().toISOString()\n      }\n    }\n  ];\n}\nconst emaDelta = longEma !== 0 ? (shortEma - longEma) / longEma : 0;\nlet signal = 'HOLD';\nif (emaDelta > threshold) {\n  signal = 'BUY';\n} else if (emaDelta < -threshold) {\n  signal = 'SELL';\n}\nreturn [\n  {\n    json: {\n      symbol,\n      price: Number(latestClose.toFixed(2)),\n      shortSma: Number(shortSma.toFixed(2)),\n      longSma: Number(longSma.toFixed(2)),\n      shortEma: shortEma !== null ? Number(shortEma.toFixed(2)) : null,\n      longEma: longEma !== null ? Number(longEma.toFixed(2)) : null,\n      emaDelta: Number(emaDelta.toFixed(4)),\n      emaThreshold: threshold,\n      signalSource: 'EMA',\n      signal,\n      generatedAt: new Date().toISOString()\n    }\n  }\n];"
+		},
+			"id": "7c17e148-4379-4445-85ef-ea0464b5fc84",
+			"name": "Calculate Signal",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [-360, 0]
+		},
+		{
+			"parameters": {
+				"jsCode": "const crypto = require('crypto');\nconst apiSecret = $env.BINANCE_API_SECRET;\nif (!apiSecret) {\n  throw new Error('BINANCE_API_SECRET is not defined.');\n}\nconst recvWindow = Number($env.BINANCE_RECV_WINDOW ?? 5000);\nconst timestamp = Date.now();\nconst query = `recvWindow=${recvWindow}&timestamp=${timestamp}`;\nconst signature = crypto\n  .createHmac('sha256', apiSecret)\n  .update(query)\n  .digest('hex');\nreturn [\n  {\n    json: {\n      recvWindow,\n      timestamp,\n      signature\n    }\n  }\n];"
+			},
+			"id": "b6376a54-9829-4425-a728-3ee359c8eba9",
+			"name": "Sign Account Snapshot",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [-360, -200]
+		},
+		{
+			"parameters": {
+				"url": "={{ $env.BINANCE_API_BASE ?? 'https://api.binance.com' }}/api/v3/account",
+				"sendQuery": true,
+				"queryParameters": {
+					"parameters": [
+						{ "name": "recvWindow", "value": "={{ $json.recvWindow }}" },
+						{ "name": "timestamp", "value": "={{ $json.timestamp }}" },
+						{ "name": "signature", "value": "={{ $json.signature }}" }
+					]
+				},
+				"sendHeaders": true,
+				"headerParameters": {
+					"parameters": [
+						{ "name": "X-MBX-APIKEY", "value": "={{ $env.BINANCE_API_KEY }}" },
+						{ "name": "Content-Type", "value": "application/x-www-form-urlencoded" }
+					]
+				},
+				"options": {}
+			},
+			"id": "7aa484df-51c6-40af-8413-9b01fbcb3bd8",
+			"name": "Fetch Account Snapshot",
+			"type": "n8n-nodes-base.httpRequest",
+			"typeVersion": 4.2,
+			"position": [-120, -200]
+		},
+		{
+			"parameters": {
+				"jsCode": "const [{ json: account }] = $input.all();\nif (!account || typeof account !== 'object') {\n  throw new Error('Failed to load Binance account snapshot.');\n}\nconst indicator = $node['Calculate Signal'].json;\nif (!indicator) {\n  throw new Error('Missing indicator payload.');\n}\nconst symbol = String(indicator.symbol ?? $env.BINANCE_SYMBOL ?? 'BTCUSDT').toUpperCase();\nconst quoteOrderQty = Number($env.BINANCE_QUOTE_ORDER_QTY ?? 50);\nconst quoteAsset = String($env.BINANCE_QUOTE_ASSET ?? 'USDT').toUpperCase();\nlet baseAsset = String($env.BINANCE_BASE_ASSET ?? '').toUpperCase();\nif (!baseAsset) {\n  if (symbol.endsWith(quoteAsset)) {\n    baseAsset = symbol.slice(0, symbol.length - quoteAsset.length);\n  } else {\n    baseAsset = symbol.replace(quoteAsset, '') || symbol;\n  }\n}\nconst balances = Array.isArray(account.balances) ? account.balances : [];\nconst toNumber = (value, fractionDigits = 8) => Number(Number(value ?? 0).toFixed(fractionDigits));\nconst findFree = (asset) => {\n  const match = balances.find((entry) => entry.asset === asset);\n  return Number(match?.free ?? 0);\n};\nconst quoteFree = findFree(quoteAsset);\nconst baseFree = findFree(baseAsset);\nconst price = Number(indicator.price ?? 0);\nconst estimatedBaseNeeded = price > 0 ? quoteOrderQty / price : 0;\nconst minQuoteReserve = Number($env.BINANCE_MIN_QUOTE_RESERVE ?? 0);\nconst minBaseReserve = Number($env.BINANCE_MIN_BASE_RESERVE ?? 0);\nconst canBuy = quoteFree - minQuoteReserve >= quoteOrderQty;\nconst canSell = estimatedBaseNeeded > 0 && baseFree - minBaseReserve >= estimatedBaseNeeded;\nconst guard = {\n  baseAsset,\n  quoteAsset,\n  baseFree: toNumber(baseFree),\n  quoteFree: toNumber(quoteFree, 2),\n  minBaseReserve,\n  minQuoteReserve,\n  estimatedBaseNeeded: toNumber(estimatedBaseNeeded),\n  canBuy,\n  canSell\n};\nconst desiredSignal = indicator.signal;\nlet signal = indicator.signal;\nlet guardReason = '';\nif (desiredSignal === 'BUY' && !canBuy) {\n  signal = 'HOLD';\n  guardReason = `Insufficient ${quoteAsset} balance for ${quoteOrderQty}`;\n} else if (desiredSignal === 'SELL' && !canSell) {\n  signal = 'HOLD';\n  guardReason = `Insufficient ${baseAsset} balance for ~${guard.estimatedBaseNeeded}`;\n}\nreturn [\n  {\n    json: {\n      ...indicator,\n      signal,\n      desiredSignal,\n      guardReason,\n      guard,\n      quoteOrderQty\n    }\n  }\n];"
+			},
+			"id": "d7bcdf45-2c2c-4a98-a53c-cc6263a46221",
+			"name": "Account Guard",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [-120, -40]
+		},
+		{
+			"parameters": {
+				"conditions": {
+					"options": {
+						"caseSensitive": false,
+						"leftValue": "",
+						"typeValidation": "strict",
+						"version": 2
+					},
+					"conditions": [
+						{
+							"id": "0bc17b8c-0666-4409-9cd4-0ed9c541993e",
+							"leftValue": "={{ $json.signal }}",
+							"rightValue": "BUY",
+							"operator": {
+								"type": "string",
+								"operation": "equals"
+							}
+						}
+					],
+					"combinator": "and"
+				},
+				"options": {}
+			},
+			"id": "8ca5aba0-585d-42dc-a2d9-f5a570189b8f",
+			"name": "Should Buy?",
+			"type": "n8n-nodes-base.if",
+			"typeVersion": 2.2,
+			"position": [-120, 60]
+		},
+		{
+			"parameters": {
+				"conditions": {
+					"options": {
+						"caseSensitive": false,
+						"leftValue": "",
+						"typeValidation": "strict",
+						"version": 2
+					},
+					"conditions": [
+						{
+							"id": "c3f802f6-0671-4f70-b93d-29d3e55deaf0",
+							"leftValue": "={{ $json.signal }}",
+							"rightValue": "SELL",
+							"operator": {
+								"type": "string",
+								"operation": "equals"
+							}
+						}
+					],
+					"combinator": "and"
+				},
+				"options": {}
+			},
+			"id": "b724c5e0-3735-474d-a14e-3b057025838c",
+			"name": "Should Sell?",
+			"type": "n8n-nodes-base.if",
+			"typeVersion": 2.2,
+			"position": [100, -80]
+		},
+		{
+			"parameters": {
+				"jsCode": "const [{ json: input }] = $input.all();\nconst quoteOrderQty = Number($env.BINANCE_QUOTE_ORDER_QTY ?? 50);\nconst recvWindow = Number($env.BINANCE_RECV_WINDOW ?? 5000);\nif (!['BUY', 'SELL'].includes(input.signal)) {\n  return [];\n}\nreturn [\n  {\n    json: {\n      symbol: input.symbol,\n      side: input.signal,\n      type: 'MARKET',\n      quoteOrderQty,\n      recvWindow,\n      timestamp: Date.now(),\n      price: input.price,\n      shortSma: input.shortSma,\n      longSma: input.longSma,\n      generatedAt: input.generatedAt\n    }\n  }\n];"
+			},
+			"id": "18a4c45e-df6b-4628-8bbb-d18aa676fa70",
+			"name": "Build Order Payload",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [320, -40]
+		},
+		{
+			"parameters": {
+				"jsCode": "const crypto = require('crypto');\nconst [{ json: payload }] = $input.all();\nconst apiSecret = $env.BINANCE_API_SECRET;\nif (!apiSecret) {\n  throw new Error('BINANCE_API_SECRET is not defined.');\n}\nconst orderedPayload = {\n  symbol: payload.symbol,\n  side: payload.side,\n  type: payload.type,\n  quoteOrderQty: payload.quoteOrderQty,\n  recvWindow: payload.recvWindow,\n  timestamp: payload.timestamp\n};\nconst query = Object.entries(orderedPayload)\n  .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)\n  .join('&');\nconst signature = crypto\n  .createHmac('sha256', apiSecret)\n  .update(query)\n  .digest('hex');\nreturn [\n  {\n    json: {\n      ...payload,\n      signature\n    }\n  }\n];"
+			},
+			"id": "b8d217fe-e1af-4ab3-baec-c9939938742e",
+			"name": "Sign Binance Order",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [540, -40]
+		},
+		{
+			"parameters": {
+				"url": "={{ $env.BINANCE_API_BASE ?? 'https://api.binance.com' }}/api/v3/order",
+				"method": "POST",
+				"sendQuery": true,
+				"queryParameters": {
+					"parameters": [
+						{ "name": "symbol", "value": "={{ $json.symbol }}" },
+						{ "name": "side", "value": "={{ $json.side }}" },
+						{ "name": "type", "value": "={{ $json.type }}" },
+						{ "name": "quoteOrderQty", "value": "={{ $json.quoteOrderQty }}" },
+						{ "name": "recvWindow", "value": "={{ $json.recvWindow }}" },
+						{ "name": "timestamp", "value": "={{ $json.timestamp }}" },
+						{ "name": "signature", "value": "={{ $json.signature }}" }
+					]
+				},
+				"sendHeaders": true,
+				"headerParameters": {
+					"parameters": [
+						{ "name": "X-MBX-APIKEY", "value": "={{ $env.BINANCE_API_KEY }}" },
+						{ "name": "Content-Type", "value": "application/x-www-form-urlencoded" }
+					]
+				},
+				"options": {}
+			},
+			"id": "a75b5532-669b-44e9-91cc-f2c42498d155",
+			"name": "Submit Binance Order",
+			"type": "n8n-nodes-base.httpRequest",
+			"typeVersion": 4.2,
+			"position": [780, -40]
+		},
+		{
+			"parameters": {
+				"jsCode": "const indicator = $node['Calculate Signal'].json;\nlet order = null;\ntry {\n  order = $node['Submit Binance Order'].json;\n} catch (error) {\n  order = null;\n}\nlet guardSnapshot = null;\ntry {\n  guardSnapshot = $node['Account Guard'].json;\n} catch (error) {\n  guardSnapshot = null;\n}\nconst input = $input.first()?.json ?? {};\nconst guard = guardSnapshot?.guard ?? input.guard ?? null;\nconst desiredSignal = input.desiredSignal ?? guardSnapshot?.desiredSignal ?? indicator.signal;\nconst indicatorPayload = {\n  price: indicator.price,\n  shortSma: indicator.shortSma,\n  longSma: indicator.longSma,\n  shortEma: indicator.shortEma,\n  longEma: indicator.longEma,\n  emaDelta: indicator.emaDelta,\n  emaThreshold: indicator.emaThreshold,\n  signalSource: indicator.signalSource,\n  generatedAt: indicator.generatedAt\n};\nif (order) {\n  return [\n    {\n      json: {\n        event: 'TRADE',\n        status: order.status ?? 'UNKNOWN',\n        symbol: order.symbol ?? indicator.symbol,\n        side: order.side ?? indicator.signal,\n        desiredSignal,\n        executedQty: Number(order.executedQty ?? 0),\n        cummulativeQuoteQty: Number(order.cummulativeQuoteQty ?? 0),\n        binanceOrderId: order.orderId ?? null,\n        guard,\n        response: order,\n        ...indicatorPayload\n      }\n    }\n  ];\n}\nconst reason = input.guardReason ?? guardSnapshot?.guardReason ?? input.reason ?? input.signal ?? indicator.signal;\nreturn [\n  {\n    json: {\n      event: 'HOLD',\n      status: 'SKIPPED',\n      symbol: indicator.symbol,\n      side: desiredSignal,\n      reason,\n      guard,\n      desiredSignal,\n      ...indicatorPayload\n    }\n  }\n];"
+			},
+			"id": "f8ed2275-4ee1-4cd2-ba4f-1125d1f34786",
+			"name": "Execution Summary",
+			"type": "n8n-nodes-base.code",
+			"typeVersion": 2,
+			"position": [1000, 40]
+		}
+	],
+	"connections": {
+		"Schedule Trigger": {
+			"main": [
+				[
+					{ "node": "Fetch Binance Candles", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Fetch Binance Candles": {
+			"main": [
+				[
+					{ "node": "Calculate Signal", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Calculate Signal": {
+			"main": [
+				[
+					{ "node": "Sign Account Snapshot", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Sign Account Snapshot": {
+			"main": [
+				[
+					{ "node": "Fetch Account Snapshot", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Fetch Account Snapshot": {
+			"main": [
+				[
+					{ "node": "Account Guard", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Account Guard": {
+			"main": [
+				[
+					{ "node": "Should Buy?", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Should Buy?": {
+			"main": [
+				[
+					{ "node": "Build Order Payload", "type": "main", "index": 0 }
+				],
+				[
+					{ "node": "Should Sell?", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Should Sell?": {
+			"main": [
+				[
+					{ "node": "Build Order Payload", "type": "main", "index": 0 }
+				],
+				[
+					{ "node": "Execution Summary", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Build Order Payload": {
+			"main": [
+				[
+					{ "node": "Sign Binance Order", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Sign Binance Order": {
+			"main": [
+				[
+					{ "node": "Submit Binance Order", "type": "main", "index": 0 }
+				]
+			]
+		},
+		"Submit Binance Order": {
+			"main": [
+				[
+					{ "node": "Execution Summary", "type": "main", "index": 0 }
+				]
+			]
+		}
+	},
+	"active": false,
+	"settings": {
+		"executionOrder": "v1"
+	},
+	"meta": {
+		"templateCredsSetupCompleted": false
+	}
+}
